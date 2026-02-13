@@ -26,15 +26,8 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
-    from rich.tree import Tree
     from rich.panel import Panel
-    from rich.layout import Layout
-    from rich.live import Live
-    from rich.text import Text
     from rich import box
-    from rich.style import Style
-    from rich.color import Color
-    from rich.columns import Columns
     RICH_AVAILABLE = True
     console = Console()
 except ImportError:
@@ -49,8 +42,6 @@ except ImportError:
 
 try:
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    from matplotlib.patches import Rectangle
     import numpy as np
     PLOT_AVAILABLE = True
 except ImportError:
@@ -74,7 +65,6 @@ class FileMetadata:
     group: str
     permissions: str
     extension: str = ''
-    is_duplicate: bool = False
     checksum: Optional[str] = None
 
 
@@ -83,7 +73,6 @@ class DirectoryStats:
     path: str
     size: int
     file_count: int
-    dir_count: int
     avg_file_size: float
     largest_file: str
     largest_file_size: int
@@ -144,8 +133,7 @@ class InodeAnalyzer:
             'empty_dirs': 0,
             'broken_symlinks': 0,
             'permission_denied': 0,
-            'file_types': defaultdict(int),
-            'top_level_summary': {}
+            'file_types': defaultdict(int)
         }
         self.threads = threads
         self.follow_symlinks = follow_symlinks
@@ -154,7 +142,6 @@ class InodeAnalyzer:
         self.lock = threading.Lock()
         self.processed_paths = set()
         self.file_metadata = {}
-        self.directory_cache = {}
         self.interrupted = False
         
         self.largest_files_heap = []
@@ -204,8 +191,8 @@ class InodeAnalyzer:
         start_time = time.time()
         
         if RICH_AVAILABLE:
-            console.rule(f"[bold blue]Inode Analyzer - {path}[/bold blue]")
-            console.print(f"Mode: {'Deep' if deep_scan else 'Quick'} Scan")
+            console.rule(f"Inode Analyzer - {path}")
+            console.print(f"Mode: {'Deep' if deep_scan else 'Quick'}")
             if find_duplicates:
                 console.print(f"Duplicate Detection: Enabled")
             if max_depth:
@@ -215,7 +202,7 @@ class InodeAnalyzer:
             print(f"\n{'='*60}")
             print(f"Inode Analyzer - {path}")
             print(f"{'='*60}")
-            print(f"Mode: {'Deep' if deep_scan else 'Quick'} Scan")
+            print(f"Mode: {'Deep' if deep_scan else 'Quick'}")
             if find_duplicates:
                 print(f"Duplicate Detection: Enabled")
             if max_depth:
@@ -254,7 +241,6 @@ class InodeAnalyzer:
             fifos_count = 0
             devices_count = 0
             
-            current_depth = 0
             base_depth = len(path.parts)
             
             for root, dirs, files in os.walk(path):
@@ -396,10 +382,10 @@ class InodeAnalyzer:
 
     def _deep_scan_analysis(self, path, sample_size, find_duplicates, age_days=None, max_depth=None):
         if RICH_AVAILABLE:
-            console.print("[bold blue]Performing Deep Analysis[/bold blue]")
+            console.print("[bold blue]Deep Analysis[/bold blue]")
             console.print()
         else:
-            print("\nPerforming deep scan analysis...\n")
+            print("\nDeep scan analysis...\n")
         
         all_items = []
         
@@ -447,13 +433,10 @@ class InodeAnalyzer:
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(bar_width=40),
                 TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TextColumn("•"),
                 TimeElapsedColumn(),
-                TextColumn("•"),
-                TextColumn("[cyan]{task.fields[eta]}[/cyan]"),
                 console=console
             ) as progress:
-                task = progress.add_task("[cyan]Scanning items...", total=total_items, eta="--:--")
+                task = progress.add_task("[cyan]Processing...", total=total_items)
                 
                 with ThreadPoolExecutor(max_workers=self.threads) as executor:
                     futures = []
@@ -468,8 +451,7 @@ class InodeAnalyzer:
                             break
                         future.result()
                         tracker.update(1)
-                        progress.update(task, advance=1, 
-                                      eta=tracker.format_eta(tracker.get_progress()[1]))
+                        progress.update(task, advance=1)
         else:
             print(f"  Scanning {self.get_human_readable(total_items, False)} items...")
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -486,17 +468,16 @@ class InodeAnalyzer:
                     future.result()
                     if i % 100 == 0 and total_items > 0:
                         progress = (i + 1) / total_items * 100
-                        eta = tracker.format_eta(tracker.get_progress()[1])
-                        print(f"\r  Progress: {progress:.1f}% ({i+1:,}/{total_items:,}) - ETA: {eta}", end='', flush=True)
+                        print(f"\r  Progress: {progress:.1f}% ({i+1:,}/{total_items:,})", end='', flush=True)
             
             if not self.interrupted:
-                print(f"\r  Progress: 100% ({total_items:,}/{total_items:,}) {' ' * 20}")
+                print(f"\r  Progress: 100% ({total_items:,}/{total_items:,})")
         
         if self.interrupted:
             if RICH_AVAILABLE:
-                console.print("[yellow]Scan interrupted. Partial results available.[/yellow]")
+                console.print("[yellow]Scan interrupted - partial results[/yellow]")
             else:
-                print("\nScan interrupted. Partial results available.")
+                print("\nScan interrupted - partial results")
         
         largest_list = []
         for item in self.largest_files_heap:
@@ -673,7 +654,6 @@ class InodeAnalyzer:
                     path=dir_path,
                     size=stats['size'],
                     file_count=stats['count'],
-                    dir_count=0,
                     avg_file_size=avg_size,
                     largest_file=stats['largest_file'],
                     largest_file_size=stats['largest']
@@ -714,9 +694,9 @@ class InodeAnalyzer:
 
     def find_duplicate_files(self, path):
         if RICH_AVAILABLE:
-            console.print("[bold blue]Searching for duplicate files...[/bold blue]")
+            console.print("[bold blue]Duplicate file detection...[/bold blue]")
         else:
-            print("  Searching for duplicate files...")
+            print("  Duplicate file detection...")
         
         size_dict = defaultdict(list)
         file_count = 0
@@ -746,17 +726,16 @@ class InodeAnalyzer:
         total_candidates = sum(1 for paths in size_dict.values() if len(paths) > 1)
         
         if RICH_AVAILABLE:
-            console.print(f"  Found {self.get_human_readable(file_count, False)} files, {self.get_human_readable(total_candidates, False)} potential duplicate sets")
+            console.print(f"  Files: {self.get_human_readable(file_count, False)} | Candidates: {self.get_human_readable(total_candidates, False)}")
             console.print("[bold blue]Computing checksums...[/bold blue]")
             
             with Progress(
                 BarColumn(bar_width=40),
                 TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                TextColumn("•"),
                 TimeElapsedColumn(),
                 console=console
             ) as progress:
-                task = progress.add_task("[cyan]Hashing files...", total=total_candidates)
+                task = progress.add_task("[cyan]Hashing...", total=total_candidates)
                 
                 for size, filepaths in size_dict.items():
                     if len(filepaths) > 1:
@@ -784,7 +763,7 @@ class InodeAnalyzer:
                         
                         progress.update(task, advance=1)
         else:
-            print(f"    Found {self.get_human_readable(file_count, False)} files, {self.get_human_readable(total_candidates, False)} potential duplicate sets")
+            print(f"    Files: {self.get_human_readable(file_count, False)} | Candidates: {self.get_human_readable(total_candidates, False)}")
             print("    Computing checksums...")
             
             processed = 0
@@ -816,16 +795,16 @@ class InodeAnalyzer:
                     if processed % 10 == 0:
                         print(f"\r      Progress: {processed}/{total_candidates}", end='', flush=True)
             
-            print(f"\r      Progress: {total_candidates}/{total_candidates} complete!")
+            print(f"\r      Progress: {total_candidates}/{total_candidates}")
         
         self.stats['duplicates'].sort(key=lambda x: x['wasted_space'], reverse=True)
         
         if RICH_AVAILABLE:
             total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
-            console.print(f"  Found {self.get_human_readable(len(self.stats['duplicates']), False)} duplicate sets, wasting {self.get_human_readable(total_wasted)}")
+            console.print(f"  Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
         else:
             total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
-            print(f"    Found {self.get_human_readable(len(self.stats['duplicates']), False)} duplicate sets, wasting {self.get_human_readable(total_wasted)}")
+            print(f"    Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
 
     def _calculate_hash_fast(self, filepath, buffer_size=65536):
         if HASH_FAST_AVAILABLE:
@@ -872,11 +851,9 @@ class InodeAnalyzer:
 
     def _fallback_analysis(self, path, sample_size):
         if RICH_AVAILABLE:
-            console.print("[yellow]Using fallback analysis method...[/yellow]")
+            console.print("[yellow]Fallback analysis...[/yellow]")
         else:
-            print("  Using fallback analysis method...")
-        
-        files_data = []
+            print("  Fallback analysis...")
         
         for root, dirs, files in os.walk(path):
             if self.interrupted:
@@ -910,25 +887,6 @@ class InodeAnalyzer:
                         age_category = self._categorize_age(datetime.fromtimestamp(mtime))
                         self.stats['age_distribution'][age_category] += 1
                         
-                        try:
-                            stat_info = os.lstat(filepath)
-                            try:
-                                owner = pwd.getpwuid(stat_info.st_uid).pw_name
-                            except:
-                                owner = str(stat_info.st_uid)
-                            self.stats['owners'][owner] += 1
-                            
-                            try:
-                                group = grp.getgrgid(stat_info.st_gid).gr_name
-                            except:
-                                group = str(stat_info.st_gid)
-                            self.stats['groups'][group] += 1
-                            
-                            perms = oct(stat_info.st_mode)[-4:]
-                            self.stats['permissions'][perms] += 1
-                        except:
-                            pass
-                        
                         heapq.heappush(self.largest_files_heap, (size, filepath, '', '', '', ''))
                         if len(self.largest_files_heap) > sample_size * 2:
                             heapq.heappop(self.largest_files_heap)
@@ -956,18 +914,18 @@ class InodeAnalyzer:
                        self.stats['total_fifos'] + self.stats['total_devices'])
         
         if RICH_AVAILABLE:
-            console.rule("[bold]Inode Analysis Report[/bold]")
+            console.rule("Inode Analysis Report")
             
-            summary_table = Table(box=box.ROUNDED, border_style="blue")
-            summary_table.add_column("Metric", style="cyan")
-            summary_table.add_column("Value", style="white", justify="right")
+            summary_table = Table(box=box.ROUNDED)
+            summary_table.add_column("Metric")
+            summary_table.add_column("Value", justify="right")
             
-            summary_table.add_row("Total Files", self.get_human_readable(self.stats['total_files'], False))
-            summary_table.add_row("Total Directories", self.get_human_readable(self.stats['total_dirs'], False))
-            summary_table.add_row("Total Symlinks", self.get_human_readable(self.stats['total_symlinks'], False))
-            summary_table.add_row("Total Sockets", self.get_human_readable(self.stats['total_sockets'], False))
-            summary_table.add_row("Total FIFOs", self.get_human_readable(self.stats['total_fifos'], False))
-            summary_table.add_row("Total Devices", self.get_human_readable(self.stats['total_devices'], False))
+            summary_table.add_row("Files", self.get_human_readable(self.stats['total_files'], False))
+            summary_table.add_row("Directories", self.get_human_readable(self.stats['total_dirs'], False))
+            summary_table.add_row("Symlinks", self.get_human_readable(self.stats['total_symlinks'], False))
+            summary_table.add_row("Sockets", self.get_human_readable(self.stats['total_sockets'], False))
+            summary_table.add_row("FIFOs", self.get_human_readable(self.stats['total_fifos'], False))
+            summary_table.add_row("Devices", self.get_human_readable(self.stats['total_devices'], False))
             summary_table.add_row("", "")
             summary_table.add_row("Total Inodes", self.get_human_readable(total_inodes, False))
             summary_table.add_row("Total Size", self.get_human_readable(self.total_size))
@@ -975,139 +933,105 @@ class InodeAnalyzer:
             summary_table.add_row("Empty Directories", self.get_human_readable(self.stats['empty_dirs'], False))
             summary_table.add_row("Broken Symlinks", self.get_human_readable(self.stats['broken_symlinks'], False))
             summary_table.add_row("Permission Denied", self.get_human_readable(self.stats['permission_denied'], False))
-            summary_table.add_row("Scan Duration", f"{elapsed_time:.2f} seconds")
+            summary_table.add_row("Scan Duration", f"{elapsed_time:.2f}s")
             
-            console.print(Panel(summary_table, title="Summary", border_style="green"))
+            console.print(Panel(summary_table, title="Summary"))
             
             if self.stats['duplicates']:
                 total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
                 total_duplicate_sets = len(self.stats['duplicates'])
                 total_duplicate_files = sum(d['count'] for d in self.stats['duplicates'])
                 
-                dup_table = Table(box=box.ROUNDED, border_style="red")
-                dup_table.add_column("Metric", style="yellow")
+                dup_table = Table(box=box.ROUNDED)
+                dup_table.add_column("Metric")
                 dup_table.add_column("Value", justify="right")
                 
                 dup_table.add_row("Duplicate Sets", self.get_human_readable(total_duplicate_sets, False))
                 dup_table.add_row("Duplicate Files", self.get_human_readable(total_duplicate_files, False))
                 dup_table.add_row("Wasted Space", self.get_human_readable(total_wasted))
                 
-                console.print(Panel(dup_table, title="Duplicate Files", border_style="red"))
+                console.print(Panel(dup_table, title="Duplicate Files"))
             
-            ext_table = Table(box=box.SIMPLE)
-            ext_table.add_column("Extension", style="green")
-            ext_table.add_column("Count", justify="right")
-            ext_table.add_column("Percentage", justify="right")
+            if self.stats['extensions']:
+                ext_table = Table(box=box.SIMPLE)
+                ext_table.add_column("Extension")
+                ext_table.add_column("Count", justify="right")
+                ext_table.add_column("Percentage", justify="right")
+                
+                sorted_exts = sorted(
+                    self.stats['extensions'].items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                for ext, count in sorted_exts:
+                    percentage = (count / max(self.stats['total_files'], 1)) * 100
+                    ext_table.add_row(f".{ext}", 
+                                    self.get_human_readable(count, False),
+                                    f"{percentage:.1f}%")
+                
+                console.print(Panel(ext_table, title="Extensions"))
             
-            sorted_exts = sorted(
-                self.stats['extensions'].items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
+            if self.stats['owners']:
+                owner_table = Table(box=box.SIMPLE)
+                owner_table.add_column("Owner")
+                owner_table.add_column("Files", justify="right")
+                owner_table.add_column("Percentage", justify="right")
+                
+                sorted_owners = sorted(
+                    self.stats['owners'].items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                
+                for owner, count in sorted_owners:
+                    percentage = (count / max(self.stats['total_files'], 1)) * 100
+                    owner_table.add_row(owner[:30],
+                                      self.get_human_readable(count, False),
+                                      f"{percentage:.1f}%")
+                
+                console.print(Panel(owner_table, title="Owners"))
             
-            for ext, count in sorted_exts:
-                percentage = (count / max(self.stats['total_files'], 1)) * 100
-                ext_table.add_row(f".{ext}", 
-                                self.get_human_readable(count, False),
-                                f"{percentage:.1f}%")
+            if self.stats['size_distribution']:
+                size_table = Table(box=box.SIMPLE)
+                size_table.add_column("Size Range")
+                size_table.add_column("Files", justify="right")
+                size_table.add_column("Percentage", justify="right")
+                
+                sorted_sizes = sorted(
+                    self.stats['size_distribution'].items(),
+                    key=lambda x: self._size_category_order(x[0])
+                )
+                
+                for category, count in sorted_sizes:
+                    percentage = (count / max(self.stats['total_files'], 1)) * 100
+                    size_table.add_row(category,
+                                     self.get_human_readable(count, False),
+                                     f"{percentage:.1f}%")
+                
+                console.print(Panel(size_table, title="Size Distribution"))
             
-            console.print(Panel(ext_table, title="File Extensions", border_style="cyan"))
-            
-            owner_table = Table(box=box.SIMPLE)
-            owner_table.add_column("Owner", style="blue")
-            owner_table.add_column("Files", justify="right")
-            owner_table.add_column("Percentage", justify="right")
-            
-            sorted_owners = sorted(
-                self.stats['owners'].items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
-            
-            for owner, count in sorted_owners:
-                percentage = (count / max(self.stats['total_files'], 1)) * 100
-                owner_table.add_row(owner[:30],
-                                  self.get_human_readable(count, False),
-                                  f"{percentage:.1f}%")
-            
-            console.print(Panel(owner_table, title="File Owners", border_style="magenta"))
-            
-            group_table = Table(box=box.SIMPLE)
-            group_table.add_column("Group", style="magenta")
-            group_table.add_column("Files", justify="right")
-            group_table.add_column("Percentage", justify="right")
-            
-            sorted_groups = sorted(
-                self.stats['groups'].items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
-            
-            for group, count in sorted_groups:
-                percentage = (count / max(self.stats['total_files'], 1)) * 100
-                group_table.add_row(group[:30],
-                                  self.get_human_readable(count, False),
-                                  f"{percentage:.1f}%")
-            
-            console.print(Panel(group_table, title="File Groups", border_style="yellow"))
-            
-            perm_table = Table(box=box.SIMPLE)
-            perm_table.add_column("Permissions", style="green")
-            perm_table.add_column("Count", justify="right")
-            perm_table.add_column("Percentage", justify="right")
-            
-            sorted_perms = sorted(
-                self.stats['permissions'].items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
-            
-            for perm, count in sorted_perms:
-                percentage = (count / max(self.stats['total_files'], 1)) * 100
-                perm_table.add_row(perm,
-                                 self.get_human_readable(count, False),
-                                 f"{percentage:.1f}%")
-            
-            console.print(Panel(perm_table, title="File Permissions", border_style="blue"))
-            
-            size_table = Table(box=box.SIMPLE)
-            size_table.add_column("Size Range", style="magenta")
-            size_table.add_column("Files", justify="right")
-            size_table.add_column("Percentage", justify="right")
-            
-            sorted_sizes = sorted(
-                self.stats['size_distribution'].items(),
-                key=lambda x: self._size_category_order(x[0])
-            )
-            
-            for category, count in sorted_sizes:
-                percentage = (count / max(self.stats['total_files'], 1)) * 100
-                size_table.add_row(category,
-                                 self.get_human_readable(count, False),
-                                 f"{percentage:.1f}%")
-            
-            console.print(Panel(size_table, title="Size Distribution", border_style="green"))
-            
-            age_table = Table(box=box.SIMPLE)
-            age_table.add_column("Age", style="yellow")
-            age_table.add_column("Files", justify="right")
-            age_table.add_column("Percentage", justify="right")
-            
-            sorted_ages = sorted(
-                self.stats['age_distribution'].items(),
-                key=lambda x: self._age_category_order(x[0])
-            )
-            
-            for category, count in sorted_ages:
-                percentage = (count / max(self.stats['total_files'], 1)) * 100
-                age_table.add_row(category,
-                                self.get_human_readable(count, False),
-                                f"{percentage:.1f}%")
-            
-            console.print(Panel(age_table, title="Age Distribution", border_style="cyan"))
+            if self.stats['age_distribution']:
+                age_table = Table(box=box.SIMPLE)
+                age_table.add_column("Age")
+                age_table.add_column("Files", justify="right")
+                age_table.add_column("Percentage", justify="right")
+                
+                sorted_ages = sorted(
+                    self.stats['age_distribution'].items(),
+                    key=lambda x: self._age_category_order(x[0])
+                )
+                
+                for category, count in sorted_ages:
+                    percentage = (count / max(self.stats['total_files'], 1)) * 100
+                    age_table.add_row(category,
+                                    self.get_human_readable(count, False),
+                                    f"{percentage:.1f}%")
+                
+                console.print(Panel(age_table, title="Age Distribution"))
             
             if self.interrupted:
-                console.print("[yellow]Scan interrupted - results are partial[/yellow]")
+                console.print("[yellow]Scan interrupted - partial results[/yellow]")
             
         else:
             print("\n" + "=" * 60)
@@ -1128,7 +1052,7 @@ class InodeAnalyzer:
             print(f"  Empty Directories:   {self.get_human_readable(self.stats['empty_dirs'], False):>18}")
             print(f"  Broken Symlinks:     {self.get_human_readable(self.stats['broken_symlinks'], False):>18}")
             print(f"  Permission Denied:   {self.get_human_readable(self.stats['permission_denied'], False):>18}")
-            print(f"  Scan Duration:       {elapsed_time:>18.2f} seconds")
+            print(f"  Scan Duration:       {elapsed_time:>18.2f}s")
             
             if self.stats['duplicates']:
                 total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
@@ -1141,7 +1065,7 @@ class InodeAnalyzer:
                 print(f"  Wasted space:        {self.get_human_readable(total_wasted):>18}")
             
             if self.stats['extensions']:
-                print(f"\nFile Extensions:")
+                print(f"\nExtensions:")
                 sorted_exts = sorted(
                     self.stats['extensions'].items(),
                     key=lambda x: x[1],
@@ -1153,14 +1077,14 @@ class InodeAnalyzer:
                     print(f"  .{ext:<20} {self.get_human_readable(count, False):>12} ({percentage:>6.1f}%)")
             
             if self.stats['owners']:
-                print(f"\nFile Owners:")
+                print(f"\nOwners:")
                 sorted_owners = sorted(
                     self.stats['owners'].items(),
                     key=lambda x: x[1],
                     reverse=True
                 )
                 
-                for owner, count in sorted_owners[:20]:
+                for owner, count in sorted_owners:
                     percentage = (count / max(self.stats['total_files'], 1)) * 100
                     print(f"  {owner:<25} {self.get_human_readable(count, False):>12} ({percentage:>6.1f}%)")
             
@@ -1175,20 +1099,9 @@ class InodeAnalyzer:
                     percentage = (count / max(self.stats['total_files'], 1)) * 100
                     print(f"  {category:<16} {self.get_human_readable(count, False):>12} ({percentage:>6.1f}%)")
             
-            if self.stats['age_distribution']:
-                print(f"\nAge Distribution:")
-                sorted_ages = sorted(
-                    self.stats['age_distribution'].items(),
-                    key=lambda x: self._age_category_order(x[0])
-                )
-                
-                for category, count in sorted_ages:
-                    percentage = (count / max(self.stats['total_files'], 1)) * 100
-                    print(f"  {category:<12} {self.get_human_readable(count, False):>12} ({percentage:>6.1f}%)")
-            
             if self.interrupted:
                 print("\n" + "!" * 50)
-                print("  Scan interrupted - results are partial")
+                print("  Scan interrupted - partial results")
                 print("!" * 50)
 
     def _size_category_order(self, category):
@@ -1221,34 +1134,22 @@ class InodeAnalyzer:
         export_stats['age_distribution'] = dict(export_stats['age_distribution'])
         export_stats['size_distribution'] = dict(export_stats['size_distribution'])
         export_stats['file_types'] = dict(export_stats['file_types'])
-        export_stats['total_inodes'] = (self.stats['total_files'] + self.stats['total_dirs'] + 
-                                       self.stats['total_symlinks'] + self.stats['total_sockets'] +
-                                       self.stats['total_fifos'] + self.stats['total_devices'])
+        export_stats['total_inodes'] = total_inodes = (self.stats['total_files'] + self.stats['total_dirs'] + 
+                                                       self.stats['total_symlinks'] + self.stats['total_sockets'] +
+                                                       self.stats['total_fifos'] + self.stats['total_devices'])
         export_stats['total_size_human'] = self.get_human_readable(self.total_size)
         export_stats['total_size'] = self.total_size
         export_stats['scan_time'] = datetime.now().isoformat()
         export_stats['interrupted'] = self.interrupted
-        
-        if self.file_metadata:
-            export_stats['file_sample'] = [
-                {
-                    'path': meta.path,
-                    'size': meta.size,
-                    'mtime': meta.mtime.isoformat(),
-                    'owner': meta.owner,
-                    'group': meta.group,
-                    'permissions': meta.permissions
-                }
-                for path, meta in list(self.file_metadata.items())[:100]
-            ]
+        export_stats['scan_duration'] = time.time() - self.start_time if hasattr(self, 'start_time') else 0
         
         with open(output_file, 'w') as f:
             json.dump(export_stats, f, indent=2, default=str)
         
         if RICH_AVAILABLE:
-            console.print(f"[green]JSON report exported to: {output_file}[/green]")
+            console.print(f"[green]JSON: {output_file}[/green]")
         else:
-            print(f"\nJSON report exported to: {output_file}")
+            print(f"\nJSON: {output_file}")
 
     def save_checkpoint(self, checkpoint_file):
         checkpoint = {
@@ -1271,9 +1172,9 @@ class InodeAnalyzer:
             pickle.dump(checkpoint, f)
         
         if RICH_AVAILABLE:
-            console.print(f"[green]Checkpoint saved to: {checkpoint_file}[/green]")
+            console.print(f"[green]Checkpoint: {checkpoint_file}[/green]")
         else:
-            print(f"\nCheckpoint saved to: {checkpoint_file}")
+            print(f"\nCheckpoint: {checkpoint_file}")
 
     def load_checkpoint(self, checkpoint_file):
         try:
@@ -1294,30 +1195,29 @@ class InodeAnalyzer:
             self.stats['file_types'] = defaultdict(int, checkpoint['stats'].get('file_types', {}))
             
             if RICH_AVAILABLE:
-                console.print(f"[green]Checkpoint loaded from: {checkpoint_file}[/green]")
-                console.print(f"[cyan]  Scan date: {checkpoint['timestamp']}[/cyan]")
+                console.print(f"[green]Loaded: {checkpoint_file}[/green]")
+                console.print(f"  Date: {checkpoint['timestamp']}")
             else:
-                print(f"\nCheckpoint loaded from: {checkpoint_file}")
-                print(f"  Scan date: {checkpoint['timestamp']}")
+                print(f"\nLoaded: {checkpoint_file}")
+                print(f"  Date: {checkpoint['timestamp']}")
                 
         except Exception as e:
             if RICH_AVAILABLE:
-                console.print(f"[red]Failed to load checkpoint: {e}[/red]")
+                console.print(f"[red]Load failed: {e}[/red]")
             else:
-                print(f"Failed to load checkpoint: {e}")
+                print(f"Load failed: {e}")
 
     def generate_visualization(self, output_file):
         if not PLOT_AVAILABLE:
             if RICH_AVAILABLE:
-                console.print("[yellow]Matplotlib not available. Install with: pip install matplotlib[/yellow]")
+                console.print("[yellow]Matplotlib not available[/yellow]")
             else:
-                print("Matplotlib not available. Install with: pip install matplotlib")
+                print("Matplotlib not available")
             return
         
         try:
             plt.style.use('seaborn-v0_8-darkgrid')
             fig = plt.figure(figsize=(20, 12))
-            fig.patch.set_facecolor('#f8f9fa')
             
             gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
             
@@ -1328,13 +1228,10 @@ class InodeAnalyzer:
                 sizes = list(file_types.values())
                 if sizes and sum(sizes) > 0:
                     colors = plt.cm.Set3(np.linspace(0, 1, len(labels)))
-                    wedges, texts, autotexts = ax1.pie(sizes, labels=labels, autopct='%1.1f%%', 
-                                                       startangle=90, colors=colors,
-                                                       wedgeprops={'edgecolor': 'white', 'linewidth': 2},
-                                                       textprops={'fontsize': 10})
-                    for autotext in autotexts:
-                        autotext.set_color('white')
-                    ax1.set_title('File Type Distribution', fontsize=14, pad=20)
+                    ax1.pie(sizes, labels=labels, autopct='%1.1f%%', 
+                           startangle=90, colors=colors,
+                           wedgeprops={'edgecolor': 'white', 'linewidth': 2})
+                    ax1.set_title('File Types')
             
             ax2 = fig.add_subplot(gs[0, 1])
             size_dist = dict(self.stats['size_distribution'])
@@ -1345,15 +1242,10 @@ class InodeAnalyzer:
                     colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(categories)))
                     bars = ax2.barh(range(len(categories)), counts, color=colors)
                     ax2.set_yticks(range(len(categories)))
-                    ax2.set_yticklabels(categories, fontsize=10)
-                    ax2.set_xlabel('Number of Files', fontsize=11)
-                    ax2.set_title('File Size Distribution', fontsize=14, pad=20)
+                    ax2.set_yticklabels(categories)
+                    ax2.set_xlabel('Files')
+                    ax2.set_title('Size Distribution')
                     ax2.grid(axis='x', alpha=0.3, linestyle='--')
-                    
-                    for bar, count in zip(bars, counts):
-                        width = bar.get_width()
-                        ax2.text(width + max(counts)*0.01, bar.get_y() + bar.get_height()/2, 
-                                f'{count:,}', ha='left', va='center', fontsize=9)
             
             ax3 = fig.add_subplot(gs[0, 2])
             age_dist = dict(self.stats['age_distribution'])
@@ -1364,13 +1256,12 @@ class InodeAnalyzer:
                     colors = ['#2ecc71', '#f1c40f', '#e67e22', '#e74c3c', '#95a5a6']
                     wedges, texts, autotexts = ax3.pie(counts, autopct='%1.1f%%', 
                                                        startangle=90, colors=colors[:len(categories)],
-                                                       wedgeprops={'edgecolor': 'white', 'linewidth': 2},
-                                                       textprops={'fontsize': 10})
+                                                       wedgeprops={'edgecolor': 'white', 'linewidth': 2})
                     for autotext in autotexts:
                         autotext.set_color('white')
-                    ax3.set_title('File Age Distribution', fontsize=14, pad=20)
+                    ax3.set_title('Age Distribution')
                     ax3.legend(wedges, categories, title="Age", loc="center left", 
-                              bbox_to_anchor=(1, 0, 0.5, 1), fontsize=9)
+                              bbox_to_anchor=(1, 0, 0.5, 1))
             
             ax4 = fig.add_subplot(gs[1, :2])
             if self.stats['largest_dirs']:
@@ -1381,15 +1272,10 @@ class InodeAnalyzer:
                     colors = plt.cm.plasma_r(np.linspace(0.2, 0.9, len(dir_names)))
                     bars = ax4.barh(range(len(dir_names)), dir_sizes, color=colors)
                     ax4.set_yticks(range(len(dir_names)))
-                    ax4.set_yticklabels(dir_names, fontsize=10)
-                    ax4.set_xlabel('Size (GB)', fontsize=11)
-                    ax4.set_title('Largest Directories', fontsize=14, pad=20)
+                    ax4.set_yticklabels(dir_names)
+                    ax4.set_xlabel('Size (GB)')
+                    ax4.set_title('Largest Directories')
                     ax4.grid(axis='x', alpha=0.3, linestyle='--')
-                    
-                    for bar, size in zip(bars, dir_sizes):
-                        width = bar.get_width()
-                        ax4.text(width + max(dir_sizes)*0.01, bar.get_y() + bar.get_height()/2, 
-                                f'{size:.2f} GB', ha='left', va='center', fontsize=9)
             
             ax5 = fig.add_subplot(gs[1, 2])
             if self.stats['owners']:
@@ -1403,11 +1289,10 @@ class InodeAnalyzer:
                     sizes = [o[1] for o in owners_data]
                     colors = plt.cm.Pastel1(np.linspace(0, 1, len(labels)))
                     wedges, texts, autotexts = ax5.pie(sizes, labels=labels, autopct='%1.1f%%',
-                                                       colors=colors, wedgeprops={'edgecolor': 'white', 'linewidth': 2},
-                                                       textprops={'fontsize': 9})
+                                                       colors=colors, wedgeprops={'edgecolor': 'white', 'linewidth': 2})
                     for autotext in autotexts:
                         autotext.set_color('black')
-                    ax5.set_title('Top Owners', fontsize=14, pad=20)
+                    ax5.set_title('Owners')
             
             ax6 = fig.add_subplot(gs[2, :])
             if self.stats['largest_files']:
@@ -1419,33 +1304,31 @@ class InodeAnalyzer:
                     colors = plt.cm.coolwarm(np.linspace(0.2, 0.9, len(file_names)))
                     bars = ax6.bar(x_pos, file_sizes, color=colors, edgecolor='white', linewidth=2)
                     ax6.set_xticks(x_pos)
-                    ax6.set_xticklabels(file_names, rotation=45, ha='right', fontsize=9)
-                    ax6.set_ylabel('Size (MB)', fontsize=11)
-                    ax6.set_xlabel('File Name', fontsize=11)
-                    ax6.set_title('Largest Files', fontsize=14, pad=20)
+                    ax6.set_xticklabels(file_names, rotation=45, ha='right')
+                    ax6.set_ylabel('Size (MB)')
+                    ax6.set_title('Largest Files')
                     ax6.grid(axis='y', alpha=0.3, linestyle='--')
-                    
-                    for bar, size in zip(bars, file_sizes):
-                        height = bar.get_height()
-                        ax6.text(bar.get_x() + bar.get_width()/2., height + max(file_sizes)*0.01,
-                                f'{size:.1f}', ha='center', va='bottom', fontsize=8)
             
-            summary_text = f"Inode Analysis Report\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            summary_text += f"Total Files: {self.get_human_readable(self.stats['total_files'], False)} | "
-            summary_text += f"Total Size: {self.get_human_readable(self.total_size)} | "
-            summary_text += f"Total Inodes: {self.get_human_readable(total_inodes, False)}"
+            total_inodes = (self.stats['total_files'] + self.stats['total_dirs'] + 
+                           self.stats['total_symlinks'] + self.stats['total_sockets'] +
+                           self.stats['total_fifos'] + self.stats['total_devices'])
+            
+            summary_text = f"Inode Analysis\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            summary_text += f"Files: {self.get_human_readable(self.stats['total_files'], False)} | "
+            summary_text += f"Size: {self.get_human_readable(self.total_size)} | "
+            summary_text += f"Inodes: {self.get_human_readable(total_inodes, False)}"
             
             fig.text(0.5, 0.98, summary_text, ha='center', fontsize=12, 
                     bbox={'facecolor': '#2c3e50', 'alpha': 0.8, 'pad': 10, 'edgecolor': 'none'},
                     color='white')
             
             plt.tight_layout()
-            plt.savefig(output_file, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+            plt.savefig(output_file, dpi=150, bbox_inches='tight')
             
             if RICH_AVAILABLE:
-                console.print(f"[green]Visualization saved to: {output_file}[/green]")
+                console.print(f"[green]Plot: {output_file}[/green]")
             else:
-                print(f"\nVisualization saved to: {output_file}")
+                print(f"\nPlot: {output_file}")
             
             if os.environ.get('DISPLAY') or sys.platform.startswith('darwin'):
                 plt.show()
@@ -1454,71 +1337,61 @@ class InodeAnalyzer:
                 
         except Exception as e:
             if RICH_AVAILABLE:
-                console.print(f"[red]Error generating visualization: {e}[/red]")
+                console.print(f"[red]Plot error: {e}[/red]")
             else:
-                print(f"Error generating visualization: {e}")
+                print(f"Plot error: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Inode usage analysis tool with scanning and visualization capabilities',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s /home/user              Scan home directory
-  %(prog)s /var --deep --duplicates Deep scan with duplicate detection
-  %(prog)s / --deep --threads 8    Deep scan with 8 threads
-  %(prog)s . --json report.json    Export results to JSON
-  %(prog)s . --plot analysis.png   Generate visualization
-  %(prog)s . --exclude "*.tmp"     Exclude temporary files
-  %(prog)s . --max-depth 3         Limit scan depth
-        """
+        description='Inode usage analysis tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     parser.add_argument('path', nargs='?', default='.',
-                       help='Directory to analyze (default: current directory)')
+                       help='Directory to analyze')
     
     parser.add_argument('--samples', type=int, default=20,
-                       help='Number of samples for largest files/dirs (default: 20)')
+                       help='Sample size for largest files/dirs')
     
     parser.add_argument('--deep', action='store_true',
-                       help='Perform deep scan with detailed metadata analysis')
+                       help='Perform deep scan')
     
     parser.add_argument('--duplicates', action='store_true',
-                       help='Find duplicate files (automatically enabled with --deep)')
+                       help='Find duplicate files')
     
     parser.add_argument('--threads', type=int, default=4,
-                       help='Number of threads for deep scan (default: 4)')
+                       help='Number of threads')
     
     parser.add_argument('--json', metavar='FILE',
-                       help='Export report to JSON file')
+                       help='Export to JSON')
     
     parser.add_argument('--plot', metavar='FILE',
-                       help='Generate visualization plot (requires matplotlib)')
+                       help='Generate visualization')
     
     parser.add_argument('--age', type=int, metavar='DAYS',
-                       help='Only analyze files accessed/modified within N days')
+                       help='Filter by age')
     
     parser.add_argument('--symlinks', action='store_true',
-                       help='Follow symbolic links (use with caution)')
+                       help='Follow symbolic links')
     
     parser.add_argument('--exclude', action='append', metavar='PATTERN',
-                       help='Exclude files/directories matching pattern (can be used multiple times)')
+                       help='Exclude patterns')
     
     parser.add_argument('--max-depth', type=int, metavar='N',
-                       help='Maximum directory depth to scan')
+                       help='Maximum depth')
     
     parser.add_argument('--save-state', metavar='FILE',
-                       help='Save scan state to resume later')
+                       help='Save checkpoint')
     
     parser.add_argument('--load-state', metavar='FILE',
-                       help='Resume scan from saved state')
+                       help='Load checkpoint')
     
     parser.add_argument('--no-rich', action='store_true',
-                       help='Disable rich output (fallback to plain text)')
+                       help='Disable rich output')
     
     parser.add_argument('--quiet', action='store_true',
-                       help='Suppress non-error output')
+                       help='Suppress output')
     
     parser.add_argument('--version', action='version',
                        version='Inode Analyzer 2.0')
@@ -1533,16 +1406,16 @@ Examples:
         args.duplicates = True
     
     if not RICH_AVAILABLE and not args.no_rich and not args.quiet:
-        print("Note: Install 'rich' for enhanced visualization: pip install rich", file=sys.stderr)
+        print("Note: Install 'rich' for enhanced output", file=sys.stderr)
     
     if not HUMANIZE_AVAILABLE and not args.quiet:
-        print("Note: Install 'humanize' for better number formatting: pip install humanize", file=sys.stderr)
+        print("Note: Install 'humanize' for better formatting", file=sys.stderr)
     
     if args.duplicates and not HASH_FAST_AVAILABLE and not args.quiet:
-        print("Note: Install 'xxhash' for faster duplicate detection: pip install xxhash", file=sys.stderr)
+        print("Note: Install 'xxhash' for faster duplicate detection", file=sys.stderr)
     
     if args.plot and not PLOT_AVAILABLE and not args.quiet:
-        print("Note: Install 'matplotlib' for visualization: pip install matplotlib", file=sys.stderr)
+        print("Note: Install 'matplotlib' for visualization", file=sys.stderr)
     
     analyzer = InodeAnalyzer(
         threads=args.threads,
