@@ -110,7 +110,7 @@ class ProgressTracker:
 
 
 class InodeAnalyzer:
-    def __init__(self, threads=4, follow_symlinks=False, exclude_patterns=None):
+    def __init__(self, threads=4, follow_symlinks=False, exclude_patterns=None, quiet=False):
         self.stats = {
             'total_files': 0,
             'total_dirs': 0,
@@ -135,14 +135,21 @@ class InodeAnalyzer:
             'permission_denied': 0,
             'file_types': defaultdict(int)
         }
-        self.threads = threads
+        self.threads = min(threads, os.cpu_count() * 2) if os.cpu_count() else threads
         self.follow_symlinks = follow_symlinks
         self.exclude_patterns = exclude_patterns or []
         self.total_size = 0
         self.lock = threading.Lock()
         self.processed_paths = set()
+        self.processed_paths_limit = 1000000
         self.file_metadata = {}
         self.interrupted = False
+        self.quiet = quiet
+        self.start_time = None
+        self.owner_cache = {}
+        self.group_cache = {}
+        self.owner_cache_lock = threading.Lock()
+        self.group_cache_lock = threading.Lock()
         
         self.largest_files_heap = []
         self.oldest_files_heap = []
@@ -152,10 +159,28 @@ class InodeAnalyzer:
     
     def _handle_interrupt(self, signum, frame):
         self.interrupted = True
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print("\n[yellow]Interrupt received, finishing current operations...[/yellow]")
-        else:
+        elif not self.quiet:
             print("\nInterrupt received, finishing current operations...")
+    
+    def _get_owner(self, uid):
+        with self.owner_cache_lock:
+            if uid not in self.owner_cache:
+                try:
+                    self.owner_cache[uid] = pwd.getpwuid(uid).pw_name
+                except:
+                    self.owner_cache[uid] = str(uid)
+            return self.owner_cache[uid]
+    
+    def _get_group(self, gid):
+        with self.group_cache_lock:
+            if gid not in self.group_cache:
+                try:
+                    self.group_cache[gid] = grp.getgrgid(gid).gr_name
+                except:
+                    self.group_cache[gid] = str(gid)
+            return self.group_cache[gid]
     
     def get_human_readable(self, value, is_bytes=True):
         if HUMANIZE_AVAILABLE:
@@ -171,10 +196,46 @@ class InodeAnalyzer:
                 return True
         return False
     
+    def _estimate_items(self, path):
+        try:
+            result = subprocess.run(
+                ['find', str(path), '-type', 'f', '-o', '-type', 'd', '2>/dev/null', '|', 'wc', '-l'],
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return int(result.stdout.strip()) or 100000
+        except:
+            return 100000
+    
+    def _size_category_order(self, category):
+        order = {
+            '< 1 KB': 1,
+            '1 KB - 1 MB': 2,
+            '1 MB - 10 MB': 3,
+            '10 MB - 100 MB': 4,
+            '100 MB - 1 GB': 5,
+            '> 1 GB': 6
+        }
+        return order.get(category, 999)
+
+    def _age_category_order(self, category):
+        order = {
+            'Today': 1,
+            'This week': 2,
+            'This month': 3,
+            'This year': 4,
+            '> 1 year': 5
+        }
+        return order.get(category, 999)
+    
     def analyze_directory(self, path, sample_size=20, deep_scan=False, 
                          find_duplicates=False, export_json=None, 
                          generate_plot=None, age_days=None, save_state=None,
                          load_state=None, max_depth=None):
+        
+        self.start_time = time.time()
         
         if load_state:
             self.load_checkpoint(load_state)
@@ -182,15 +243,13 @@ class InodeAnalyzer:
         
         path = Path(path).resolve()
         if not path.exists():
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[bold red]Path does not exist: {path}[/bold red]")
-            else:
+            elif not self.quiet:
                 print(f"Error: Path does not exist: {path}")
             return
         
-        start_time = time.time()
-        
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.rule(f"Inode Analyzer - {path}")
             console.print(f"Mode: {'Deep' if deep_scan else 'Quick'}")
             if find_duplicates:
@@ -198,7 +257,7 @@ class InodeAnalyzer:
             if max_depth:
                 console.print(f"Max Depth: {max_depth}")
             console.print()
-        else:
+        elif not self.quiet:
             print(f"\n{'='*60}")
             print(f"Inode Analyzer - {path}")
             print(f"{'='*60}")
@@ -220,7 +279,7 @@ class InodeAnalyzer:
         if save_state:
             self.save_checkpoint(save_state)
         
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.time() - self.start_time
         self.print_report(elapsed_time)
         
         if export_json:
@@ -231,7 +290,7 @@ class InodeAnalyzer:
 
     def _quick_scan_analysis(self, path, sample_size, max_depth=None):
         try:
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print("[cyan]Scanning filesystem...[/cyan]")
             
             files_count = 0
@@ -281,30 +340,25 @@ class InodeAnalyzer:
                                 ext = file.rsplit('.', 1)[-1].lower()
                                 self.stats['extensions'][ext] += 1
                             
-                            try:
-                                owner = pwd.getpwuid(stat_info.st_uid).pw_name
-                            except:
-                                owner = str(stat_info.st_uid)
-                            self.stats['owners'][owner] += 1
+                            owner = self._get_owner(stat_info.st_uid)
+                            group = self._get_group(stat_info.st_gid)
                             
-                            try:
-                                group = grp.getgrgid(stat_info.st_gid).gr_name
-                            except:
-                                group = str(stat_info.st_gid)
-                            self.stats['groups'][group] += 1
-                            
-                            perms = oct(mode)[-4:]
-                            self.stats['permissions'][perms] += 1
-                            
-                            size_category = self._categorize_size(size)
-                            self.stats['size_distribution'][size_category] += 1
-                            
-                            if size == 0:
-                                self.stats['empty_files'] += 1
-                            
-                            mtime = datetime.fromtimestamp(stat_info.st_mtime)
-                            age_category = self._categorize_age(mtime)
-                            self.stats['age_distribution'][age_category] += 1
+                            with self.lock:
+                                self.stats['owners'][owner] += 1
+                                self.stats['groups'][group] += 1
+                                
+                                perms = oct(mode)[-4:]
+                                self.stats['permissions'][perms] += 1
+                                
+                                size_category = self._categorize_size(size)
+                                self.stats['size_distribution'][size_category] += 1
+                                
+                                if size == 0:
+                                    self.stats['empty_files'] += 1
+                                
+                                mtime = datetime.fromtimestamp(stat_info.st_mtime)
+                                age_category = self._categorize_age(mtime)
+                                self.stats['age_distribution'][age_category] += 1
                             
                             metadata = FileMetadata(
                                 path=filepath,
@@ -320,71 +374,66 @@ class InodeAnalyzer:
                             
                             self.file_metadata[filepath] = metadata
                             
-                            heapq.heappush(self.largest_files_heap, (size, filepath, mtime.isoformat(), owner, group, perms))
-                            if len(self.largest_files_heap) > sample_size * 2:
-                                heapq.heappop(self.largest_files_heap)
-                            
-                            heapq.heappush(self.oldest_files_heap, (mtime.timestamp(), filepath, size, owner, group, perms))
-                            if len(self.oldest_files_heap) > sample_size * 2:
-                                heapq.heappop(self.oldest_files_heap)
-                            
-                            heapq.heappush(self.newest_files_heap, (-mtime.timestamp(), filepath, size, owner, group, perms))
-                            if len(self.newest_files_heap) > sample_size * 2:
-                                heapq.heappop(self.newest_files_heap)
+                            with self.lock:
+                                heapq.heappush(self.largest_files_heap, (size, filepath, mtime.isoformat(), owner, group, perms))
+                                if len(self.largest_files_heap) > sample_size * 2:
+                                    heapq.heappop(self.largest_files_heap)
+                                
+                                heapq.heappush(self.oldest_files_heap, (mtime.timestamp(), filepath, size, owner, group, perms))
+                                if len(self.oldest_files_heap) > sample_size * 2:
+                                    heapq.heappop(self.oldest_files_heap)
+                                
+                                heapq.heappush(self.newest_files_heap, (-mtime.timestamp(), filepath, size, owner, group, perms))
+                                if len(self.newest_files_heap) > sample_size * 2:
+                                    heapq.heappop(self.newest_files_heap)
                                 
                     except OSError:
-                        self.stats['permission_denied'] += 1
+                        with self.lock:
+                            self.stats['permission_denied'] += 1
                         continue
                 
                 for dirname in dirs:
                     dirpath = os.path.join(root, dirname)
                     try:
                         if not os.listdir(dirpath):
-                            self.stats['empty_dirs'] += 1
+                            with self.lock:
+                                self.stats['empty_dirs'] += 1
                     except OSError:
                         pass
             
-            self.stats['total_files'] = files_count
-            self.stats['total_dirs'] = dirs_count
-            self.stats['total_symlinks'] = symlinks_count
-            self.stats['total_sockets'] = sockets_count
-            self.stats['total_fifos'] = fifos_count
-            self.stats['total_devices'] = devices_count
-            
-            largest_list = []
-            for item in self.largest_files_heap:
-                largest_list.append(item)
-            largest_list.sort(key=lambda x: x[0], reverse=True)
-            self.stats['largest_files'] = largest_list[:sample_size]
-            
-            oldest_list = []
-            for item in self.oldest_files_heap:
-                oldest_list.append(item)
-            oldest_list.sort(key=lambda x: x[0])
-            self.stats['oldest_files'] = [(item[2], item[1], datetime.fromtimestamp(item[0]).isoformat(), item[3], item[4], item[5]) 
-                                         for item in oldest_list[:sample_size]]
-            
-            newest_list = []
-            for item in self.newest_files_heap:
-                newest_list.append(item)
-            newest_list.sort(key=lambda x: x[0])
-            self.stats['newest_files'] = [(item[2], item[1], datetime.fromtimestamp(-item[0]).isoformat(), item[3], item[4], item[5]) 
-                                         for item in newest_list[:sample_size]]
+            with self.lock:
+                self.stats['total_files'] = files_count
+                self.stats['total_dirs'] = dirs_count
+                self.stats['total_symlinks'] = symlinks_count
+                self.stats['total_sockets'] = sockets_count
+                self.stats['total_fifos'] = fifos_count
+                self.stats['total_devices'] = devices_count
+                
+                largest_list = sorted(self.largest_files_heap, key=lambda x: x[0], reverse=True)
+                self.stats['largest_files'] = largest_list[:sample_size]
+                
+                oldest_list = sorted(self.oldest_files_heap, key=lambda x: x[0])
+                self.stats['oldest_files'] = [(item[2], item[1], datetime.fromtimestamp(item[0]).isoformat(), item[3], item[4], item[5]) 
+                                             for item in oldest_list[:sample_size]]
+                
+                newest_list = sorted(self.newest_files_heap, key=lambda x: x[0])
+                self.stats['newest_files'] = [(item[2], item[1], datetime.fromtimestamp(-item[0]).isoformat(), item[3], item[4], item[5]) 
+                                             for item in newest_list[:sample_size]]
             
             self._analyze_largest_directories(path, sample_size)
             
         except Exception as e:
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[yellow]Scan failed: {e}, using fallback...[/yellow]")
-            else:
+            elif not self.quiet:
                 print(f"Scan failed: {e}, using fallback...")
             self._fallback_analysis(path, sample_size)
 
     def _deep_scan_analysis(self, path, sample_size, find_duplicates, age_days=None, max_depth=None):
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print("[bold blue]Deep Analysis[/bold blue]")
             console.print()
-        else:
+        elif not self.quiet:
             print("\nDeep scan analysis...\n")
         
         all_items = []
@@ -418,16 +467,16 @@ class InodeAnalyzer:
                         except Exception:
                             pass
         except Exception as e:
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[red]Error during walk: {e}[/red]")
-            else:
+            elif not self.quiet:
                 print(f"Error during walk: {e}")
             return
         
         total_items = len(all_items)
         tracker = ProgressTracker(total_items, "Analyzing items")
         
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -441,7 +490,7 @@ class InodeAnalyzer:
                 with ThreadPoolExecutor(max_workers=self.threads) as executor:
                     futures = []
                     for item in all_items:
-                        if str(item) not in self.processed_paths and not self.interrupted:
+                        if len(self.processed_paths) < self.processed_paths_limit and str(item) not in self.processed_paths and not self.interrupted:
                             self.processed_paths.add(str(item))
                             futures.append(executor.submit(self._analyze_item_deep, item, age_days))
                     
@@ -453,11 +502,12 @@ class InodeAnalyzer:
                         tracker.update(1)
                         progress.update(task, advance=1)
         else:
-            print(f"  Scanning {self.get_human_readable(total_items, False)} items...")
+            if not self.quiet:
+                print(f"  Scanning {self.get_human_readable(total_items, False)} items...")
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
                 futures = []
                 for item in all_items:
-                    if str(item) not in self.processed_paths and not self.interrupted:
+                    if len(self.processed_paths) < self.processed_paths_limit and str(item) not in self.processed_paths and not self.interrupted:
                         self.processed_paths.add(str(item))
                         futures.append(executor.submit(self._analyze_item_deep, item, age_days))
                 
@@ -466,38 +516,30 @@ class InodeAnalyzer:
                         executor.shutdown(wait=False)
                         break
                     future.result()
-                    if i % 100 == 0 and total_items > 0:
+                    if not self.quiet and i % 100 == 0 and total_items > 0:
                         progress = (i + 1) / total_items * 100
                         print(f"\r  Progress: {progress:.1f}% ({i+1:,}/{total_items:,})", end='', flush=True)
             
-            if not self.interrupted:
+            if not self.quiet and not self.interrupted:
                 print(f"\r  Progress: 100% ({total_items:,}/{total_items:,})")
         
-        if self.interrupted:
+        if self.interrupted and not self.quiet:
             if RICH_AVAILABLE:
                 console.print("[yellow]Scan interrupted - partial results[/yellow]")
             else:
                 print("\nScan interrupted - partial results")
         
-        largest_list = []
-        for item in self.largest_files_heap:
-            largest_list.append(item)
-        largest_list.sort(key=lambda x: x[0], reverse=True)
-        self.stats['largest_files'] = largest_list[:sample_size]
-        
-        oldest_list = []
-        for item in self.oldest_files_heap:
-            oldest_list.append(item)
-        oldest_list.sort(key=lambda x: x[0])
-        self.stats['oldest_files'] = [(item[2], item[1], datetime.fromtimestamp(item[0]).isoformat(), item[3], item[4], item[5]) 
-                                     for item in oldest_list[:sample_size]]
-        
-        newest_list = []
-        for item in self.newest_files_heap:
-            newest_list.append(item)
-        newest_list.sort(key=lambda x: x[0])
-        self.stats['newest_files'] = [(item[2], item[1], datetime.fromtimestamp(-item[0]).isoformat(), item[3], item[4], item[5]) 
-                                     for item in newest_list[:sample_size]]
+        with self.lock:
+            largest_list = sorted(self.largest_files_heap, key=lambda x: x[0], reverse=True)
+            self.stats['largest_files'] = largest_list[:sample_size]
+            
+            oldest_list = sorted(self.oldest_files_heap, key=lambda x: x[0])
+            self.stats['oldest_files'] = [(item[2], item[1], datetime.fromtimestamp(item[0]).isoformat(), item[3], item[4], item[5]) 
+                                         for item in oldest_list[:sample_size]]
+            
+            newest_list = sorted(self.newest_files_heap, key=lambda x: x[0])
+            self.stats['newest_files'] = [(item[2], item[1], datetime.fromtimestamp(-item[0]).isoformat(), item[3], item[4], item[5]) 
+                                         for item in newest_list[:sample_size]]
         
         self._analyze_largest_directories(path, sample_size, deep=True)
         
@@ -513,9 +555,7 @@ class InodeAnalyzer:
             mode = stat_info.st_mode
             
             if stat.S_ISREG(mode):
-                with self.lock:
-                    self.stats['total_files'] += 1
-                    self.stats['file_types']['regular'] += 1
+                size = stat_info.st_size
                 
                 if age_days:
                     mtime = datetime.fromtimestamp(stat_info.st_mtime)
@@ -523,43 +563,36 @@ class InodeAnalyzer:
                     if age.days > age_days:
                         return
                 
-                size = stat_info.st_size
-                with self.lock:
-                    self.total_size += size
-                
                 ext = ''
                 if item.name and '.' in item.name:
                     ext = item.name.rsplit('.', 1)[-1].lower()
                 
+                owner = self._get_owner(stat_info.st_uid)
+                group = self._get_group(stat_info.st_gid)
+                perms = oct(mode)[-4:]
+                mtime = datetime.fromtimestamp(stat_info.st_mtime)
+                atime = datetime.fromtimestamp(stat_info.st_atime)
+                ctime = datetime.fromtimestamp(stat_info.st_ctime)
+                size_category = self._categorize_size(size)
+                age_category = self._categorize_age(mtime)
+                
                 with self.lock:
+                    self.stats['total_files'] += 1
+                    self.stats['file_types']['regular'] += 1
+                    self.total_size += size
+                    
                     if ext:
                         self.stats['extensions'][ext] += 1
                     
-                    self.stats['permissions'][oct(mode)[-4:]] += 1
-                    
-                    try:
-                        owner = pwd.getpwuid(stat_info.st_uid).pw_name
-                    except:
-                        owner = str(stat_info.st_uid)
+                    self.stats['permissions'][perms] += 1
                     self.stats['owners'][owner] += 1
-                    
-                    try:
-                        group = grp.getgrgid(stat_info.st_gid).gr_name
-                    except:
-                        group = str(stat_info.st_gid)
                     self.stats['groups'][group] += 1
                     
-                    size_category = self._categorize_size(size)
                     self.stats['size_distribution'][size_category] += 1
                     
                     if size == 0:
                         self.stats['empty_files'] += 1
                     
-                    mtime = datetime.fromtimestamp(stat_info.st_mtime)
-                    atime = datetime.fromtimestamp(stat_info.st_atime)
-                    ctime = datetime.fromtimestamp(stat_info.st_ctime)
-                    
-                    age_category = self._categorize_age(mtime)
                     self.stats['age_distribution'][age_category] += 1
                     
                     metadata = FileMetadata(
@@ -570,21 +603,21 @@ class InodeAnalyzer:
                         ctime=ctime,
                         owner=owner,
                         group=group,
-                        permissions=oct(mode)[-4:],
+                        permissions=perms,
                         extension=ext
                     )
                     
                     self.file_metadata[str(item)] = metadata
                     
-                    heapq.heappush(self.largest_files_heap, (size, str(item), mtime.isoformat(), owner, group, oct(mode)[-4:]))
+                    heapq.heappush(self.largest_files_heap, (size, str(item), mtime.isoformat(), owner, group, perms))
                     if len(self.largest_files_heap) > 1000:
                         heapq.heappop(self.largest_files_heap)
                     
-                    heapq.heappush(self.oldest_files_heap, (mtime.timestamp(), str(item), size, owner, group, oct(mode)[-4:]))
+                    heapq.heappush(self.oldest_files_heap, (mtime.timestamp(), str(item), size, owner, group, perms))
                     if len(self.oldest_files_heap) > 1000:
                         heapq.heappop(self.oldest_files_heap)
                     
-                    heapq.heappush(self.newest_files_heap, (-mtime.timestamp(), str(item), size, owner, group, oct(mode)[-4:]))
+                    heapq.heappush(self.newest_files_heap, (-mtime.timestamp(), str(item), size, owner, group, perms))
                     if len(self.newest_files_heap) > 1000:
                         heapq.heappop(self.newest_files_heap)
             
@@ -625,7 +658,12 @@ class InodeAnalyzer:
                     self.stats['total_devices'] += 1
                     self.stats['file_types']['device'] += 1
                     
-        except (PermissionError, OSError):
+        except PermissionError:
+            with self.lock:
+                self.stats['permission_denied'] += 1
+                if RICH_AVAILABLE and not self.quiet:
+                    console.print(f"[dim]Permission denied: {item}[/dim]")
+        except OSError:
             with self.lock:
                 self.stats['permission_denied'] += 1
         except Exception:
@@ -693,13 +731,15 @@ class InodeAnalyzer:
                 pass
 
     def find_duplicate_files(self, path):
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print("[bold blue]Duplicate file detection...[/bold blue]")
-        else:
+        elif not self.quiet:
             print("  Duplicate file detection...")
         
         size_dict = defaultdict(list)
         file_count = 0
+        BATCH_SIZE = 10000
+        batch_count = 0
         
         for root, dirs, files in os.walk(path):
             if self.interrupted:
@@ -717,15 +757,24 @@ class InodeAnalyzer:
                         if size > 0:
                             size_dict[size].append(filepath)
                             file_count += 1
+                            
+                            if len(size_dict) > BATCH_SIZE:
+                                self._process_duplicate_batch(size_dict)
+                                batch_count += 1
+                                if not self.quiet and batch_count % 10 == 0:
+                                    print(f"\r    Processed {batch_count * BATCH_SIZE} files...", end='', flush=True)
                 except OSError:
                     continue
+        
+        if size_dict and not self.interrupted:
+            self._process_duplicate_batch(size_dict)
         
         if self.interrupted:
             return
         
-        total_candidates = sum(1 for paths in size_dict.values() if len(paths) > 1)
+        total_candidates = len([1 for paths in size_dict.values() if len(paths) > 1])
         
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print(f"  Files: {self.get_human_readable(file_count, False)} | Candidates: {self.get_human_readable(total_candidates, False)}")
             console.print("[bold blue]Computing checksums...[/bold blue]")
             
@@ -744,7 +793,8 @@ class InodeAnalyzer:
                         for filepath in filepaths:
                             try:
                                 checksum = self._calculate_hash_fast(filepath)
-                                checksum_dict[checksum].append(filepath)
+                                if checksum:
+                                    checksum_dict[checksum].append(filepath)
                             except (OSError, IOError):
                                 continue
                         
@@ -762,7 +812,7 @@ class InodeAnalyzer:
                                 })
                         
                         progress.update(task, advance=1)
-        else:
+        elif not self.quiet:
             print(f"    Files: {self.get_human_readable(file_count, False)} | Candidates: {self.get_human_readable(total_candidates, False)}")
             print("    Computing checksums...")
             
@@ -774,7 +824,8 @@ class InodeAnalyzer:
                     for filepath in filepaths:
                         try:
                             checksum = self._calculate_hash_fast(filepath)
-                            checksum_dict[checksum].append(filepath)
+                            if checksum:
+                                checksum_dict[checksum].append(filepath)
                         except (OSError, IOError):
                             continue
                     
@@ -799,12 +850,15 @@ class InodeAnalyzer:
         
         self.stats['duplicates'].sort(key=lambda x: x['wasted_space'], reverse=True)
         
-        if RICH_AVAILABLE:
-            total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
-            console.print(f"  Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
-        else:
-            total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
-            print(f"    Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
+        total_wasted = sum(d['wasted_space'] for d in self.stats['duplicates'])
+        if not self.quiet:
+            if RICH_AVAILABLE:
+                console.print(f"  Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
+            else:
+                print(f"    Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
+    
+    def _process_duplicate_batch(self, size_dict):
+        pass
 
     def _calculate_hash_fast(self, filepath, buffer_size=65536):
         if HASH_FAST_AVAILABLE:
@@ -850,9 +904,9 @@ class InodeAnalyzer:
             return '> 1 year'
 
     def _fallback_analysis(self, path, sample_size):
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print("[yellow]Fallback analysis...[/yellow]")
-        else:
+        elif not self.quiet:
             print("  Fallback analysis...")
         
         for root, dirs, files in os.walk(path):
@@ -902,13 +956,13 @@ class InodeAnalyzer:
                 except OSError:
                     pass
         
-        largest_list = []
-        for item in self.largest_files_heap:
-            largest_list.append(item)
-        largest_list.sort(key=lambda x: x[0], reverse=True)
+        largest_list = sorted(self.largest_files_heap, key=lambda x: x[0], reverse=True)
         self.stats['largest_files'] = largest_list[:sample_size]
 
     def print_report(self, elapsed_time):
+        if self.quiet:
+            return
+            
         total_inodes = (self.stats['total_files'] + self.stats['total_dirs'] + 
                        self.stats['total_symlinks'] + self.stats['total_sockets'] +
                        self.stats['total_fifos'] + self.stats['total_devices'])
@@ -1104,27 +1158,6 @@ class InodeAnalyzer:
                 print("  Scan interrupted - partial results")
                 print("!" * 50)
 
-    def _size_category_order(self, category):
-        order = {
-            '< 1 KB': 1,
-            '1 KB - 1 MB': 2,
-            '1 MB - 10 MB': 3,
-            '10 MB - 100 MB': 4,
-            '100 MB - 1 GB': 5,
-            '> 1 GB': 6
-        }
-        return order.get(category, 999)
-
-    def _age_category_order(self, category):
-        order = {
-            'Today': 1,
-            'This week': 2,
-            'This month': 3,
-            'This year': 4,
-            '> 1 year': 5
-        }
-        return order.get(category, 999)
-
     def export_json(self, output_file):
         export_stats = self.stats.copy()
         export_stats['extensions'] = dict(export_stats['extensions'])
@@ -1134,21 +1167,21 @@ class InodeAnalyzer:
         export_stats['age_distribution'] = dict(export_stats['age_distribution'])
         export_stats['size_distribution'] = dict(export_stats['size_distribution'])
         export_stats['file_types'] = dict(export_stats['file_types'])
-        export_stats['total_inodes'] = total_inodes = (self.stats['total_files'] + self.stats['total_dirs'] + 
-                                                       self.stats['total_symlinks'] + self.stats['total_sockets'] +
-                                                       self.stats['total_fifos'] + self.stats['total_devices'])
+        export_stats['total_inodes'] = (self.stats['total_files'] + self.stats['total_dirs'] + 
+                                       self.stats['total_symlinks'] + self.stats['total_sockets'] +
+                                       self.stats['total_fifos'] + self.stats['total_devices'])
         export_stats['total_size_human'] = self.get_human_readable(self.total_size)
         export_stats['total_size'] = self.total_size
         export_stats['scan_time'] = datetime.now().isoformat()
         export_stats['interrupted'] = self.interrupted
-        export_stats['scan_duration'] = time.time() - self.start_time if hasattr(self, 'start_time') else 0
+        export_stats['scan_duration'] = time.time() - self.start_time if self.start_time else 0
         
         with open(output_file, 'w') as f:
             json.dump(export_stats, f, indent=2, default=str)
         
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print(f"[green]JSON: {output_file}[/green]")
-        else:
+        elif not self.quiet:
             print(f"\nJSON: {output_file}")
 
     def save_checkpoint(self, checkpoint_file):
@@ -1171,9 +1204,9 @@ class InodeAnalyzer:
         with open(checkpoint_file, 'wb') as f:
             pickle.dump(checkpoint, f)
         
-        if RICH_AVAILABLE:
+        if RICH_AVAILABLE and not self.quiet:
             console.print(f"[green]Checkpoint: {checkpoint_file}[/green]")
-        else:
+        elif not self.quiet:
             print(f"\nCheckpoint: {checkpoint_file}")
 
     def load_checkpoint(self, checkpoint_file):
@@ -1194,24 +1227,24 @@ class InodeAnalyzer:
             self.stats['size_distribution'] = defaultdict(int, checkpoint['stats'].get('size_distribution', {}))
             self.stats['file_types'] = defaultdict(int, checkpoint['stats'].get('file_types', {}))
             
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[green]Loaded: {checkpoint_file}[/green]")
                 console.print(f"  Date: {checkpoint['timestamp']}")
-            else:
+            elif not self.quiet:
                 print(f"\nLoaded: {checkpoint_file}")
                 print(f"  Date: {checkpoint['timestamp']}")
                 
         except Exception as e:
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[red]Load failed: {e}[/red]")
-            else:
+            elif not self.quiet:
                 print(f"Load failed: {e}")
 
     def generate_visualization(self, output_file):
         if not PLOT_AVAILABLE:
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print("[yellow]Matplotlib not available[/yellow]")
-            else:
+            elif not self.quiet:
                 print("Matplotlib not available")
             return
         
@@ -1325,9 +1358,9 @@ class InodeAnalyzer:
             plt.tight_layout()
             plt.savefig(output_file, dpi=150, bbox_inches='tight')
             
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[green]Plot: {output_file}[/green]")
-            else:
+            elif not self.quiet:
                 print(f"\nPlot: {output_file}")
             
             if os.environ.get('DISPLAY') or sys.platform.startswith('darwin'):
@@ -1336,9 +1369,9 @@ class InodeAnalyzer:
                 plt.close()
                 
         except Exception as e:
-            if RICH_AVAILABLE:
+            if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[red]Plot error: {e}[/red]")
-            else:
+            elif not self.quiet:
                 print(f"Plot error: {e}")
 
 
@@ -1396,7 +1429,15 @@ def main():
     parser.add_argument('--version', action='version',
                        version='Inode Analyzer 2.0')
     
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Show what would be scanned without actual scanning')
+    
     args = parser.parse_args()
+    
+    if args.dry_run:
+        print(f"Dry run: Would analyze {args.path}")
+        print(f"Options: deep={args.deep}, duplicates={args.duplicates}, threads={args.threads}")
+        return
     
     if args.no_rich:
         global RICH_AVAILABLE
@@ -1420,7 +1461,8 @@ def main():
     analyzer = InodeAnalyzer(
         threads=args.threads,
         follow_symlinks=args.symlinks,
-        exclude_patterns=args.exclude or []
+        exclude_patterns=args.exclude or [],
+        quiet=args.quiet
     )
     
     analyzer.analyze_directory(
