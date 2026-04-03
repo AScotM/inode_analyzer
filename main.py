@@ -21,6 +21,7 @@ import pickle
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Set
 import signal
+import shlex
 
 try:
     from rich.console import Console
@@ -110,6 +111,23 @@ class ProgressTracker:
 
 
 class InodeAnalyzer:
+    SIZE_CATEGORIES = {
+        '< 1 KB': (0, 1024),
+        '1 KB - 1 MB': (1024, 1024 * 1024),
+        '1 MB - 10 MB': (1024 * 1024, 10 * 1024 * 1024),
+        '10 MB - 100 MB': (10 * 1024 * 1024, 100 * 1024 * 1024),
+        '100 MB - 1 GB': (100 * 1024 * 1024, 1024 * 1024 * 1024),
+        '> 1 GB': (1024 * 1024 * 1024, float('inf'))
+    }
+    
+    AGE_CATEGORIES = {
+        'Today': 0,
+        'This week': 7,
+        'This month': 30,
+        'This year': 365,
+        '> 1 year': float('inf')
+    }
+    
     def __init__(self, threads=4, follow_symlinks=False, exclude_patterns=None, quiet=False):
         self.stats = {
             'total_files': 0,
@@ -198,9 +216,9 @@ class InodeAnalyzer:
     
     def _estimate_items(self, path):
         try:
+            escaped_path = shlex.quote(str(path))
             result = subprocess.run(
-                ['find', str(path), '-type', 'f', '-o', '-type', 'd', '2>/dev/null', '|', 'wc', '-l'],
-                shell=True,
+                ['sh', '-c', f'find {escaped_path} -type f -o -type d 2>/dev/null | wc -l'],
                 capture_output=True,
                 text=True,
                 timeout=5
@@ -229,6 +247,33 @@ class InodeAnalyzer:
             '> 1 year': 5
         }
         return order.get(category, 999)
+    
+    def _categorize_size(self, size):
+        if size < 1024:
+            return '< 1 KB'
+        elif size < 1024 * 1024:
+            return '1 KB - 1 MB'
+        elif size < 10 * 1024 * 1024:
+            return '1 MB - 10 MB'
+        elif size < 100 * 1024 * 1024:
+            return '10 MB - 100 MB'
+        elif size < 1024 * 1024 * 1024:
+            return '100 MB - 1 GB'
+        else:
+            return '> 1 GB'
+
+    def _categorize_age(self, mtime):
+        age = datetime.now() - mtime
+        if age.days < 1:
+            return 'Today'
+        elif age.days < 7:
+            return 'This week'
+        elif age.days < 30:
+            return 'This month'
+        elif age.days < 365:
+            return 'This year'
+        else:
+            return '> 1 year'
     
     def analyze_directory(self, path, sample_size=20, deep_scan=False, 
                          find_duplicates=False, export_json=None, 
@@ -436,10 +481,10 @@ class InodeAnalyzer:
         elif not self.quiet:
             print("\nDeep scan analysis...\n")
         
-        all_items = []
+        total_items = 0
+        base_depth = len(path.parts)
         
         try:
-            base_depth = len(path.parts)
             for root, dirs, files in os.walk(path):
                 if self.interrupted:
                     break
@@ -449,23 +494,17 @@ class InodeAnalyzer:
                     dirs.clear()
                 
                 if not self._should_exclude(Path(root)):
-                    all_items.append(Path(root))
+                    total_items += 1
                 
                 for d in dirs:
                     dir_path = Path(root) / d
                     if not self._should_exclude(dir_path):
-                        try:
-                            all_items.append(dir_path)
-                        except Exception:
-                            pass
+                        total_items += 1
                 
                 for f in files:
                     file_path = Path(root) / f
                     if not self._should_exclude(file_path):
-                        try:
-                            all_items.append(file_path)
-                        except Exception:
-                            pass
+                        total_items += 1
         except Exception as e:
             if RICH_AVAILABLE and not self.quiet:
                 console.print(f"[red]Error during walk: {e}[/red]")
@@ -473,7 +512,6 @@ class InodeAnalyzer:
                 print(f"Error during walk: {e}")
             return
         
-        total_items = len(all_items)
         tracker = ProgressTracker(total_items, "Analyzing items")
         
         if RICH_AVAILABLE and not self.quiet:
@@ -489,10 +527,32 @@ class InodeAnalyzer:
                 
                 with ThreadPoolExecutor(max_workers=self.threads) as executor:
                     futures = []
-                    for item in all_items:
-                        if len(self.processed_paths) < self.processed_paths_limit and str(item) not in self.processed_paths and not self.interrupted:
-                            self.processed_paths.add(str(item))
-                            futures.append(executor.submit(self._analyze_item_deep, item, age_days))
+                    for root, dirs, files in os.walk(path):
+                        if self.interrupted:
+                            break
+                        
+                        current_depth = len(Path(root).parts) - base_depth
+                        if max_depth and current_depth >= max_depth:
+                            dirs.clear()
+                        
+                        if not self._should_exclude(Path(root)):
+                            if len(self.processed_paths) < self.processed_paths_limit and str(root) not in self.processed_paths:
+                                self.processed_paths.add(str(root))
+                                futures.append(executor.submit(self._analyze_item_deep, Path(root), age_days))
+                        
+                        for d in dirs:
+                            dir_path = Path(root) / d
+                            if not self._should_exclude(dir_path):
+                                if len(self.processed_paths) < self.processed_paths_limit and str(dir_path) not in self.processed_paths:
+                                    self.processed_paths.add(str(dir_path))
+                                    futures.append(executor.submit(self._analyze_item_deep, dir_path, age_days))
+                        
+                        for f in files:
+                            file_path = Path(root) / f
+                            if not self._should_exclude(file_path):
+                                if len(self.processed_paths) < self.processed_paths_limit and str(file_path) not in self.processed_paths:
+                                    self.processed_paths.add(str(file_path))
+                                    futures.append(executor.submit(self._analyze_item_deep, file_path, age_days))
                     
                     for future in as_completed(futures):
                         if self.interrupted:
@@ -506,10 +566,32 @@ class InodeAnalyzer:
                 print(f"  Scanning {self.get_human_readable(total_items, False)} items...")
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
                 futures = []
-                for item in all_items:
-                    if len(self.processed_paths) < self.processed_paths_limit and str(item) not in self.processed_paths and not self.interrupted:
-                        self.processed_paths.add(str(item))
-                        futures.append(executor.submit(self._analyze_item_deep, item, age_days))
+                for root, dirs, files in os.walk(path):
+                    if self.interrupted:
+                        break
+                    
+                    current_depth = len(Path(root).parts) - base_depth
+                    if max_depth and current_depth >= max_depth:
+                        dirs.clear()
+                    
+                    if not self._should_exclude(Path(root)):
+                        if len(self.processed_paths) < self.processed_paths_limit and str(root) not in self.processed_paths:
+                            self.processed_paths.add(str(root))
+                            futures.append(executor.submit(self._analyze_item_deep, Path(root), age_days))
+                    
+                    for d in dirs:
+                        dir_path = Path(root) / d
+                        if not self._should_exclude(dir_path):
+                            if len(self.processed_paths) < self.processed_paths_limit and str(dir_path) not in self.processed_paths:
+                                self.processed_paths.add(str(dir_path))
+                                futures.append(executor.submit(self._analyze_item_deep, dir_path, age_days))
+                    
+                    for f in files:
+                        file_path = Path(root) / f
+                        if not self._should_exclude(file_path):
+                            if len(self.processed_paths) < self.processed_paths_limit and str(file_path) not in self.processed_paths:
+                                self.processed_paths.add(str(file_path))
+                                futures.append(executor.submit(self._analyze_item_deep, file_path, age_days))
                 
                 for i, future in enumerate(as_completed(futures)):
                     if self.interrupted:
@@ -858,7 +940,37 @@ class InodeAnalyzer:
                 print(f"    Duplicate sets: {self.get_human_readable(len(self.stats['duplicates']), False)} | Wasted: {self.get_human_readable(total_wasted)}")
     
     def _process_duplicate_batch(self, size_dict):
-        pass
+        if not size_dict:
+            return
+        
+        for size, filepaths in list(size_dict.items()):
+            if len(filepaths) > 1:
+                checksum_dict = defaultdict(list)
+                
+                for filepath in filepaths:
+                    try:
+                        checksum = self._calculate_hash_fast(filepath)
+                        if checksum:
+                            checksum_dict[checksum].append(filepath)
+                    except (OSError, IOError):
+                        continue
+                
+                for checksum, duplicate_files in checksum_dict.items():
+                    if len(duplicate_files) > 1:
+                        total_size = size * len(duplicate_files)
+                        wasted_space = size * (len(duplicate_files) - 1)
+                        
+                        with self.lock:
+                            self.stats['duplicates'].append({
+                                'size': size,
+                                'checksum': checksum,
+                                'files': duplicate_files,
+                                'total_size': total_size,
+                                'wasted_space': wasted_space,
+                                'count': len(duplicate_files)
+                            })
+                
+                size_dict.pop(size)
 
     def _calculate_hash_fast(self, filepath, buffer_size=65536):
         if HASH_FAST_AVAILABLE:
@@ -875,33 +987,6 @@ class InodeAnalyzer:
             return hasher.hexdigest()
         except Exception:
             return None
-
-    def _categorize_size(self, size):
-        if size < 1024:
-            return '< 1 KB'
-        elif size < 1024 * 1024:
-            return '1 KB - 1 MB'
-        elif size < 10 * 1024 * 1024:
-            return '1 MB - 10 MB'
-        elif size < 100 * 1024 * 1024:
-            return '10 MB - 100 MB'
-        elif size < 1024 * 1024 * 1024:
-            return '100 MB - 1 GB'
-        else:
-            return '> 1 GB'
-
-    def _categorize_age(self, mtime):
-        age = datetime.now() - mtime
-        if age.days < 1:
-            return 'Today'
-        elif age.days < 7:
-            return 'This week'
-        elif age.days < 30:
-            return 'This month'
-        elif age.days < 365:
-            return 'This year'
-        else:
-            return '> 1 year'
 
     def _fallback_analysis(self, path, sample_size):
         if RICH_AVAILABLE and not self.quiet:
@@ -941,9 +1026,10 @@ class InodeAnalyzer:
                         age_category = self._categorize_age(datetime.fromtimestamp(mtime))
                         self.stats['age_distribution'][age_category] += 1
                         
-                        heapq.heappush(self.largest_files_heap, (size, filepath, '', '', '', ''))
-                        if len(self.largest_files_heap) > sample_size * 2:
-                            heapq.heappop(self.largest_files_heap)
+                        with self.lock:
+                            heapq.heappush(self.largest_files_heap, (size, filepath, '', '', '', ''))
+                            if len(self.largest_files_heap) > sample_size * 2:
+                                heapq.heappop(self.largest_files_heap)
                     
                 except OSError:
                     self.stats['permission_denied'] += 1
@@ -1190,7 +1276,11 @@ class InodeAnalyzer:
             'total_size': self.total_size,
             'processed_paths': list(self.processed_paths)[:10000],
             'timestamp': datetime.now().isoformat(),
-            'interrupted': self.interrupted
+            'interrupted': self.interrupted,
+            'largest_files_heap': self.largest_files_heap,
+            'oldest_files_heap': self.oldest_files_heap,
+            'newest_files_heap': self.newest_files_heap,
+            'file_metadata_keys': list(self.file_metadata.keys())[:10000]
         }
         
         checkpoint['stats']['extensions'] = dict(self.stats['extensions'])
@@ -1218,6 +1308,13 @@ class InodeAnalyzer:
             self.total_size = checkpoint['total_size']
             self.processed_paths = set(checkpoint['processed_paths'])
             self.interrupted = checkpoint['interrupted']
+            
+            if 'largest_files_heap' in checkpoint:
+                self.largest_files_heap = checkpoint['largest_files_heap']
+            if 'oldest_files_heap' in checkpoint:
+                self.oldest_files_heap = checkpoint['oldest_files_heap']
+            if 'newest_files_heap' in checkpoint:
+                self.newest_files_heap = checkpoint['newest_files_heap']
             
             self.stats['extensions'] = defaultdict(int, checkpoint['stats'].get('extensions', {}))
             self.stats['permissions'] = defaultdict(int, checkpoint['stats'].get('permissions', {}))
